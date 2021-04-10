@@ -21,9 +21,13 @@ type FrontEndConfig struct {
 	TracerSecret         []byte
 }
 
-type FrontEndStorageStarted struct{}
+type FrontEndStorageStarted struct {
+	StorageID string
+}
 
-type FrontEndStorageFailed struct{}
+type FrontEndStorageFailed struct {
+	StorageID string
+}
 
 type FrontEndPut struct {
 	Key   string

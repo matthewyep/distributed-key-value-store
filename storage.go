@@ -24,26 +24,40 @@ type StorageConfig struct {
 }
 
 type StorageLoadSuccess struct {
-	State map[string]string
+	StorageID string
+	State     map[string]string
 }
 
 type StoragePut struct {
-	Key   string
-	Value string
+	StorageID string
+	Key       string
+	Value     string
 }
 
 type StorageSaveData struct {
-	Key   string
-	Value string
+	StorageID string
+	Key       string
+	Value     string
 }
 
 type StorageGet struct {
-	Key string
+	StorageID string
+	Key       string
 }
 
 type StorageGetResult struct {
-	Key   string
-	Value *string
+	StorageID string
+	Key       string
+	Value     *string
+}
+
+type StorageJoining struct {
+	StorageID string
+}
+
+type StorageJoined struct {
+	StorageID string
+	State     map[string]string
 }
 
 type Storage struct {
@@ -92,7 +106,7 @@ type StoragePutResp struct {
 	Token tracing.TracingToken
 }
 
-func (s *Storage) Start(frontEndAddr string, storageAddr string, diskPath string, stracer *tracing.Tracer) error {
+func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr string, diskPath string, stracer *tracing.Tracer) error {
 	// create local strace
 	s.stracer = stracer
 	if stracer != nil {
