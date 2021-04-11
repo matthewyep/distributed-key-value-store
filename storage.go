@@ -106,6 +106,15 @@ type StoragePutResp struct {
 	Token tracing.TracingToken
 }
 
+type StorageGetStateArgs struct {
+	Token tracing.TracingToken
+}
+
+type StorageGetStateResp struct {
+	State map[string]string
+	Token tracing.TracingToken
+}
+
 func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr string, diskPath string, stracer *tracing.Tracer) error {
 	// create local strace
 	s.stracer = stracer
@@ -144,18 +153,29 @@ func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr strin
 	log.Printf("serving Storage RPCs on port %s", storageAddr)
 	go server.Accept(listener)
 
-	// notify Frontend
-	args := StorageConnectArgs{
+	// join request to Frontend
+	AttemptRecordAction(s.strace, StorageJoining{StorageID: storageId})
+	args := StorageJoinArgs{
+		StorageID:   storageId,
 		StorageAddr: storageAddr,
 		Token:       AttemptGenerateToken(s.strace),
 	}
-
-	reply := StorageConnectResp{}
-	err = frontend.Call("FrontEnd.StorageConnect", args, &reply)
+	reply := StorageJoinResp{}
+	err = frontend.Call("FrontEnd.StorageJoin", args, &reply)
 	if err != nil {
 		return fmt.Errorf("failed to notify Frontend: %w", err)
 	}
 	s.AttemptReceiveToken(&reply.RetToken)
+
+	// merge with latest store
+	err = s.mergeStore(reply.State)
+	if err != nil {
+		return fmt.Errorf("failed to merge state from Frontend: %w", err)
+	}
+	AttemptRecordAction(s.strace, StorageJoined{
+		StorageID: storageId,
+		State:     s.store.kv,
+	})
 
 	// run forever
 	for {
@@ -207,6 +227,23 @@ func (s *Storage) initStore() error {
 	return nil
 }
 
+func (s *Storage) mergeStore(that map[string]string) error {
+	for k, thatV := range that {
+		thisV, ok := s.store.get(k)
+		if !ok || thisV != thatV {
+			s.store.put(k, thatV)
+			err := s.recorder.record(StoreRecord{
+				Key:   k,
+				Value: thatV,
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Storage) Get(args StorageGetArgs, reply *StorageGetResp) error {
 	trace := s.AttemptReceiveToken(&args.Token)
 
@@ -253,6 +290,17 @@ func (s *Storage) Put(args StoragePutArgs, reply *StoragePutResp) error {
 	s.store.mu.Unlock()
 
 	reply.Value = value
+	reply.Token = AttemptGenerateToken(trace)
+	return nil
+}
+
+func (s *Storage) GetStore(args StorageGetStateArgs, reply *StorageGetStateResp) error {
+	trace := s.AttemptReceiveToken(&args.Token)
+
+	s.store.mu.RLock()
+	reply.State = s.store.kv
+	s.store.mu.RUnlock()
+
 	reply.Token = AttemptGenerateToken(trace)
 	return nil
 }
