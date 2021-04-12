@@ -4,6 +4,7 @@ import (
 	"example.org/cpsc416/a5/kvslib"
 	"fmt"
 	"github.com/DistributedClocks/tracing"
+	"log"
 	"net"
 	"net/rpc"
 	"sync"
@@ -48,6 +49,41 @@ type FrontEndGetResult struct {
 	Err   bool
 }
 
+type FrontEndStorageJoined struct {
+	StorageIds []string
+}
+
+// TODO: remove these later
+// Tracing structs for debugging
+type FrontEndGetFailed struct {
+	StorageID string
+	Key       string
+}
+
+type FrontEndGetSucceeded struct {
+	StorageID string
+	Key       string
+	Value     string
+}
+
+type FrontEndPutFailed struct {
+	StorageID string
+	Key       string
+	Value     string
+}
+
+type FrontEndPutSucceeded struct {
+	StorageID string
+	Key       string
+	Value     string
+}
+
+type FailedNodes struct {
+	IDs []string
+}
+
+type TotalFailure struct{}
+
 type FrontEnd struct {
 	// state may go here
 	tracer         *tracing.Tracer
@@ -60,17 +96,35 @@ type FrontEnd struct {
 	ops            map[string][]StartOpChan
 	opsMu          sync.Mutex
 	once           sync.Once
+
+	joinedNodes   map[string]*rpc.Client
+	joinedNodesMu sync.RWMutex
+	joining       bool
+	joiningMu     sync.RWMutex
+	joiningOps    map[string][]StartOpChan
+	joiningOpsMu  sync.Mutex
+	putWg         sync.WaitGroup
+
+	txnQueue []StartOpChan
+	txnMu    sync.Mutex
 }
 
 type StartOpChan chan struct{}
 
+// StorageReqCall associates an async rpc.Call with the storageID it was sent to
+type StorageReqCall struct {
+	ID   string
+	Call *rpc.Call
+}
+
 /***** RPC structs *****/
-type StorageConnectArgs struct {
+type StorageJoinArgs struct {
+	StorageID   string
 	StorageAddr string
 	Token       tracing.TracingToken
 }
 
-type StorageConnectResp struct {
+type StorageJoinResp struct {
 	RetToken tracing.TracingToken
 }
 
@@ -82,6 +136,9 @@ func (d *FrontEnd) Start(clientAPIListenAddr string, storageAPIListenAddr string
 	d.tracer = ftrace
 	d.storageTimeout = storageTimeout
 	d.ops = make(map[string][]StartOpChan)
+	d.joinedNodes = make(map[string]*rpc.Client)
+	d.joiningOps = make(map[string][]StartOpChan)
+	d.txnQueue = make([]StartOpChan, 0, 25)
 
 	server := rpc.NewServer()
 	err := server.Register(d)
@@ -113,91 +170,134 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 	d.enqueueOperation(args.Key, startCh)
 	<-startCh
 
-	// initialize tracing struct to error values
-	frontendGetRes := FrontEndGetResult{
-		Key:   args.Key,
-		Value: nil,
-		Err:   true,
-	}
-	// initialize reply to error values
-	reply.Key = args.Key
-	reply.Error = true
-	reply.Ok = false
+	// using write mutex to enforce request ordering
+	d.joinedNodesMu.Lock()
+	numNodes := len(d.joinedNodes)
+	callResults := make(chan *StorageReqCall, numNodes)
+	succeeded := false
 
-	storageArgs := StorageGetArgs{
-		Key:   args.Key,
-		Token: AttemptGenerateToken(trace),
-	}
-	storageResp := StorageGetResp{}
-	var call *rpc.Call = nil
-
-	d.clientMu.RLock()
-	if d.storageClient != nil {
-		call = d.storageClient.Go("Storage.Get", storageArgs, &storageResp, nil)
-	} else {
-		// record error, since no storage connection has been established
-		d.once.Do(func() {
-			AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{})
+	if numNodes == 0 {
+		// no storage nodes joined, so abort immediately
+		trace.RecordAction(TotalFailure{})
+		AttemptRecordAction(trace, FrontEndGetResult{
+			Key:   args.Key,
+			Value: nil,
+			Err:   true,
 		})
-		AttemptRecordAction(trace, frontendGetRes)
-	}
-	d.clientMu.RUnlock()
+		d.joinedNodesMu.Unlock()
 
-	if call == nil {
-		// return error
+		reply.Key = args.Key
+		reply.Ok = false
+		reply.Error = true
 		reply.RetToken = AttemptGenerateToken(trace)
 		return nil
 	}
 
-	<-call.Done
-	if call.Error == nil {
-		// success
-		d.AttemptReceiveToken(&storageResp.Token)
+	queue := make(StartOpChan, 1)
+	d.enqueueTransaction(queue)
 
-		var value *string = nil
-		if storageResp.Ok {
-			value = &storageResp.Value
+	var respVal string
+	var respOk bool
+
+	for storageID, client := range d.joinedNodes {
+		storageArgs := StorageGetArgs{
+			Key:   args.Key,
+			Token: AttemptGenerateToken(trace),
 		}
-		frontendGetRes.Value = value
-		frontendGetRes.Err = false
-		d.recordSuccess(trace, frontendGetRes)
+		storageResp := StorageGetResp{}
 
-		reply.Value = storageResp.Value
-		reply.Ok = storageResp.Ok
-		reply.Error = false
-		reply.RetToken = AttemptGenerateToken(trace)
-		return nil
+		call := client.Go("Storage.Get", storageArgs, &storageResp, nil)
+		go func() {
+			<-call.Done
+			if call.Error == nil {
+				d.AttemptReceiveToken(&storageResp.Token)
+				respVal = storageResp.Value
+				respOk = storageResp.Ok
+			}
+			callResults <- &StorageReqCall{storageID, call}
+		}()
+	}
+	d.joinedNodesMu.Unlock()
+
+	var failedNodes []string
+
+	for i := 0; i < numNodes; i++ {
+		storageCall := <-callResults
+		if storageCall.Call.Error != nil {
+			failedNodes = append(failedNodes, storageCall.ID)
+			trace.RecordAction(FrontEndGetFailed{storageCall.ID, args.Key})
+		} else {
+			succeeded = true
+			trace.RecordAction(FrontEndPutSucceeded{storageCall.ID, args.Key, respVal})
+		}
 	}
 
-	// timeout, then retry
-	time.Sleep(time.Duration(d.storageTimeout) * time.Second)
-	storageArgs.Token = AttemptGenerateToken(trace)
+	// if some requests failed, then retry on those nodes
+	// since RPC is using the same TCP connection, the retry should always fail
+	if len(failedNodes) != 0 {
+		trace.RecordAction(FailedNodes{failedNodes})
+		time.Sleep(time.Duration(d.storageTimeout) * time.Second)
 
-	d.clientMu.RLock()
-	call = d.storageClient.Go("Storage.Get", storageArgs, &storageResp, nil)
-	d.clientMu.RUnlock()
+		d.joinedNodesMu.RLock()
+		for _, storageID := range failedNodes {
+			if client, ok := d.joinedNodes[storageID]; ok {
+				storageArgs := StorageGetArgs{
+					Key:   args.Key,
+					Token: AttemptGenerateToken(trace),
+				}
+				storageResp := StorageGetResp{}
+				err := client.Call("Storage.Put", storageArgs, storageResp)
+				// TODO: remove this assertion later
+				if err == nil {
+					// the retry should never succeed
+					log.Fatalf("retry to %v succeeded...\n", storageID)
+				}
+			}
+		}
+		d.joinedNodesMu.RUnlock()
+	}
 
-	<-call.Done
-	if call.Error != nil {
-		// fail
-		d.recordFailure(trace, frontendGetRes)
+	// wait for turn in transaction queue
+	<-queue
+	defer d.dequeueTransaction()
+
+	if len(failedNodes) != 0 {
+		// remove failed nodes from the joined set
+		d.joinedNodesMu.Lock()
+		for _, storageID := range failedNodes {
+			if _, ok := d.joinedNodes[storageID]; ok {
+				delete(d.joinedNodes, storageID)
+				AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{storageID})
+				d.UnsafeRecordFEStorageJoined()
+			}
+		}
+		d.joinedNodesMu.Unlock()
+	}
+
+	var value *string = nil
+	if respOk {
+		value = &respVal
+	}
+
+	if succeeded {
+		AttemptRecordAction(trace, FrontEndGetResult{
+			Key:   args.Key,
+			Value: value,
+			Err:   false,
+		})
+		reply.Error = false
 	} else {
-		// success
-		d.AttemptReceiveToken(&storageResp.Token)
-
-		var value *string = nil
-		if storageResp.Ok {
-			value = &storageResp.Value
-		}
-		frontendGetRes.Value = value
-		frontendGetRes.Err = false
-		d.recordSuccess(trace, frontendGetRes)
-
-		reply.Value = storageResp.Value
-		reply.Ok = storageResp.Ok
-		reply.Error = false
+		AttemptRecordAction(trace, FrontEndGetResult{
+			Key:   args.Key,
+			Value: nil,
+			Err:   true,
+		})
+		reply.Error = true
 	}
 
+	reply.Key = args.Key
+	reply.Value = respVal
+	reply.Ok = respOk
 	reply.RetToken = AttemptGenerateToken(trace)
 	return nil
 }
@@ -217,72 +317,117 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 	d.enqueueOperation(args.Key, startCh)
 	<-startCh
 
-	// initialize tracing struct to error values
-	frontendPutRes := FrontEndPutResult{
-		Err: true,
+	// spinlock blocks until no storage nodes are joining
+	for {
+		d.joiningMu.RLock()
+		if d.joining == false {
+			d.putWg.Add(1)
+			break
+		}
+		d.joiningMu.RUnlock()
 	}
-	// initialize reply to error values
-	reply.Error = true
+	defer d.putWg.Done()
 
-	storageArgs := StoragePutArgs{
-		Key:   args.Key,
-		Value: args.Value,
-		Token: AttemptGenerateToken(trace),
-	}
-	storageResp := StoragePutResp{}
-	var call *rpc.Call = nil
+	// using write mutex to enforce request ordering
+	d.joinedNodesMu.Lock()
+	numNodes := len(d.joinedNodes)
+	callResults := make(chan *StorageReqCall, numNodes)
+	succeeded := false
 
-	d.clientMu.RLock()
-	if d.storageClient != nil {
-		call = d.storageClient.Go("Storage.Put", storageArgs, &storageResp, nil)
-	} else {
-		// record error, since no storage connection has been established
-		d.once.Do(func() {
-			AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{})
-		})
-		AttemptRecordAction(trace, frontendPutRes)
-	}
-	d.clientMu.RUnlock()
-
-	if call == nil {
-		// return error
+	if numNodes == 0 {
+		// no storage nodes joined, so abort immediately
+		trace.RecordAction(TotalFailure{})
+		AttemptRecordAction(trace, FrontEndPutResult{true})
+		d.joinedNodesMu.Unlock()
+		reply.Error = true
 		reply.RetToken = AttemptGenerateToken(trace)
 		return nil
 	}
 
-	<-call.Done
-	if call.Error == nil {
-		// success
-		d.AttemptReceiveToken(&storageResp.Token)
+	queue := make(StartOpChan, 1)
+	d.enqueueTransaction(queue)
 
-		frontendPutRes.Err = false
-		d.recordSuccess(trace, frontendPutRes)
+	for storageID, client := range d.joinedNodes {
+		storageArgs := StoragePutArgs{
+			Key:   args.Key,
+			Value: args.Value,
+			Token: AttemptGenerateToken(trace),
+		}
+		storageResp := StoragePutResp{}
 
-		reply.Error = false
-		reply.RetToken = AttemptGenerateToken(trace)
-		return nil
+		call := client.Go("Storage.Put", storageArgs, &storageResp, nil)
+		go func() {
+			<-call.Done
+			if call.Error == nil {
+				d.AttemptReceiveToken(&storageResp.Token)
+			}
+			callResults <- &StorageReqCall{storageID, call}
+		}()
+	}
+	d.joinedNodesMu.Unlock()
+
+	var failedNodes []string
+
+	for i := 0; i < numNodes; i++ {
+		storageCall := <-callResults
+		if storageCall.Call.Error != nil {
+			failedNodes = append(failedNodes, storageCall.ID)
+			trace.RecordAction(FrontEndPutFailed{storageCall.ID, args.Key, args.Value})
+		} else {
+			succeeded = true
+			trace.RecordAction(FrontEndPutSucceeded{storageCall.ID, args.Key, args.Value})
+		}
 	}
 
-	// timeout, then retry
-	time.Sleep(time.Duration(d.storageTimeout) * time.Second)
-	storageArgs.Token = AttemptGenerateToken(trace)
+	// if some requests failed, then retry on those nodes
+	// since RPC is using the same TCP connection, the retry should always fail
+	if len(failedNodes) != 0 {
+		trace.RecordAction(FailedNodes{failedNodes})
+		time.Sleep(time.Duration(d.storageTimeout) * time.Second)
 
-	d.clientMu.RLock()
-	call = d.storageClient.Go("Storage.Put", storageArgs, &storageResp, nil)
-	d.clientMu.RUnlock()
+		d.joinedNodesMu.RLock()
+		for _, storageID := range failedNodes {
+			if client, ok := d.joinedNodes[storageID]; ok {
+				storageArgs := StoragePutArgs{
+					Key:   args.Key,
+					Value: args.Value,
+					Token: AttemptGenerateToken(trace),
+				}
+				storageResp := StoragePutResp{}
+				err := client.Call("Storage.Put", storageArgs, storageResp)
+				// TODO: remove this assertion later
+				if err == nil {
+					// the retry should never succeed
+					log.Fatalf("retry to %v succeeded...\n", storageID)
+				}
+			}
+		}
+		d.joinedNodesMu.RUnlock()
+	}
 
-	<-call.Done
-	if call.Error != nil {
-		// fail
-		d.recordFailure(trace, frontendPutRes)
-	} else {
-		// success
-		d.AttemptReceiveToken(&storageResp.Token)
+	// wait for turn in transaction queue
+	<-queue
+	defer d.dequeueTransaction()
 
-		frontendPutRes.Err = false
-		d.recordSuccess(trace, frontendPutRes)
+	if len(failedNodes) != 0 {
+		// remove failed nodes from the joined set
+		d.joinedNodesMu.Lock()
+		for _, storageID := range failedNodes {
+			if _, ok := d.joinedNodes[storageID]; ok {
+				delete(d.joinedNodes, storageID)
+				AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{storageID})
+				d.UnsafeRecordFEStorageJoined()
+			}
+		}
+		d.joinedNodesMu.Unlock()
+	}
 
+	if succeeded {
+		AttemptRecordAction(trace, FrontEndPutResult{Err: false})
 		reply.Error = false
+	} else {
+		AttemptRecordAction(trace, FrontEndPutResult{Err: true})
+		reply.Error = true
 	}
 
 	reply.RetToken = AttemptGenerateToken(trace)
@@ -298,20 +443,107 @@ func (d *FrontEnd) ResultAck(args kvslib.ResultAckArgs, reply *kvslib.ResultAckR
 	return nil
 }
 
-func (d *FrontEnd) StorageConnect(args StorageConnectArgs, reply *StorageConnectResp) error {
+func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) error {
 	storageTrace := d.AttemptReceiveToken(&args.Token)
+	storageID := args.StorageID
 
-	const numRetries int = 2
-	for i := 0; i < numRetries; i++ {
-		client, err := rpc.Dial("tcp", args.StorageAddr)
-		if err != nil {
-			continue
+	client, err := rpc.Dial("tcp", args.StorageAddr)
+	if err != nil {
+		// storage node is down, so immediately abort
+		reply.RetToken = AttemptGenerateToken(storageTrace)
+		return nil
+	}
+
+	d.joiningOpsMu.Lock()
+	if len(d.joiningOps) == 0 {
+		// block all put requests
+		d.joiningMu.Lock()
+		d.joining = true
+		d.joiningMu.Unlock()
+	}
+	start := make(StartOpChan, 1)
+	d.unsafeEnqueueJoinOp(storageID, start)
+	d.joiningOpsMu.Unlock()
+
+	defer func() {
+		d.unsafeDequeueJoinOp(storageID)
+		if len(d.joiningOps) == 0 {
+			// unblock put requests
+			d.joiningMu.Lock()
+			d.joining = false
+			d.joiningMu.Unlock()
+		}
+	}()
+
+	// wait for all outstanding put requests to complete
+	d.putWg.Wait()
+
+	// if there are other storage join ops with this ID queued up, wait for them to finish
+	<-start
+	skipUpdate := false
+
+	d.joinedNodesMu.Lock()
+	if _, ok := d.joinedNodes[storageID]; ok {
+		// record failure if, for some reason, we never detected it earlier
+		delete(d.joinedNodes, storageID)
+		AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{storageID})
+		d.UnsafeRecordFEStorageJoined()
+	}
+	AttemptRecordAction(d.frontendTrace, FrontEndStorageStarted{storageID})
+	if len(d.joinedNodes) == 0 {
+		skipUpdate = true
+	}
+	d.joinedNodesMu.Unlock()
+
+	var recentState map[string]string
+
+	// get the most recent state from some joined node
+	if !skipUpdate {
+		d.joinedNodesMu.RLock()
+		getStateSucceeded := false
+		getStateResp := StorageGetStateResp{}
+		for _, joinedClient := range d.joinedNodes {
+			getStateArgs := StorageGetStateArgs{AttemptGenerateToken(storageTrace)}
+
+			err := joinedClient.Call("Storage.GetStore", getStateArgs, &getStateResp)
+			if err == nil {
+				d.AttemptReceiveToken(&getStateResp.Token)
+				getStateSucceeded = true
+				break
+			}
+		}
+		d.joinedNodesMu.RUnlock()
+
+		// TODO: remove this assertion later
+		if getStateSucceeded == false {
+			storageTrace.RecordAction(TotalFailure{})
+			log.Fatalf("total failure should never occur when nodes are joining")
 		}
 
-		d.clientMu.Lock()
-		d.storageClient = client
-		d.clientMu.Unlock()
+		recentState = getStateResp.State
 	}
+
+	// send state to joining node
+	updateArgs := StorageUpdateStateArgs{
+		State:      recentState,
+		SkipUpdate: skipUpdate,
+		Token:      AttemptGenerateToken(storageTrace),
+	}
+	updateResp := StorageUpdateStateResp{}
+	err = client.Call("Storage.UpdateState", updateArgs, &updateResp)
+	if err != nil {
+		reply.RetToken = AttemptGenerateToken(storageTrace)
+		AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{storageID})
+		return nil
+	}
+
+	// update succeeded, add node to joined nodes
+	d.AttemptReceiveToken(&updateResp.RetToken)
+
+	d.joinedNodesMu.Lock()
+	d.joinedNodes[storageID] = client
+	d.UnsafeRecordFEStorageJoined()
+	d.joinedNodesMu.Unlock()
 
 	reply.RetToken = AttemptGenerateToken(storageTrace)
 	return nil
@@ -397,6 +629,48 @@ func (d *FrontEnd) dequeueOperation(key string) {
 	}
 }
 
+func (d *FrontEnd) unsafeEnqueueJoinOp(key string, ch StartOpChan) {
+	opQueue, ok := d.joiningOps[key]
+	if ok {
+		d.joiningOps[key] = append(opQueue, ch)
+	} else {
+		d.joiningOps[key] = []StartOpChan{ch}
+		ch <- struct{}{}
+	}
+}
+
+func (d *FrontEnd) unsafeDequeueJoinOp(key string) {
+	chQueue := d.joiningOps[key]
+	if len(chQueue) <= 1 {
+		delete(d.joiningOps, key)
+	} else {
+		d.joiningOps[key] = chQueue[1:]
+		d.joiningOps[key][0] <- struct{}{}
+	}
+}
+
+func (d *FrontEnd) enqueueTransaction(ch StartOpChan) {
+	d.txnMu.Lock()
+	defer d.txnMu.Unlock()
+
+	d.txnQueue = append(d.txnQueue, ch)
+
+	if len(d.txnQueue) == 1 {
+		ch <- struct{}{}
+	}
+}
+
+func (d *FrontEnd) dequeueTransaction() {
+	d.txnMu.Lock()
+	defer d.txnMu.Unlock()
+
+	d.txnQueue = d.txnQueue[1:]
+
+	if len(d.txnQueue) > 0 {
+		d.txnQueue[0] <- struct{}{}
+	}
+}
+
 func (d *FrontEnd) AttemptReceiveToken(token *tracing.TracingToken) *tracing.Trace {
 	if d.tracer != nil {
 		return d.tracer.ReceiveToken(*token)
@@ -415,5 +689,21 @@ func AttemptGenerateToken(trace *tracing.Trace) tracing.TracingToken {
 func AttemptRecordAction(trace *tracing.Trace, action interface{}) {
 	if trace != nil {
 		trace.RecordAction(action)
+	}
+}
+
+func (d *FrontEnd) UnsafeRecordFEStorageJoined() {
+	// Note: this function is NOT thread safe;
+	// The mutex for joinedNodes must be held by the caller!!
+	if d.frontendTrace != nil {
+		set := make([]string, len(d.joinedNodes))
+		i := 0
+
+		for storageID := range d.joinedNodes {
+			set[i] = storageID
+			i += 1
+		}
+
+		d.frontendTrace.RecordAction(FrontEndStorageJoined{set})
 	}
 }
