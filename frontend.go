@@ -72,7 +72,6 @@ type StorageJoinArgs struct {
 }
 
 type StorageJoinResp struct {
-	State    map[string]string
 	RetToken tracing.TracingToken
 }
 
@@ -315,10 +314,6 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		d.clientMu.Unlock()
 	}
 
-	reply.State = map[string]string{
-		"key1": "val1",
-		"key2": "val2",
-	}
 	reply.RetToken = AttemptGenerateToken(storageTrace)
 	return nil
 }
