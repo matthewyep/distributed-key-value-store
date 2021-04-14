@@ -89,13 +89,8 @@ type FrontEnd struct {
 	tracer         *tracing.Tracer
 	frontendTrace  *tracing.Trace
 	storageTimeout uint8
-	storageClient  *rpc.Client
-	clientMu       sync.RWMutex
-	storageStarted bool
-	storageMu      sync.RWMutex
 	ops            map[string][]StartOpChan
 	opsMu          sync.Mutex
-	once           sync.Once
 
 	joinedNodes   map[string]*rpc.Client
 	joinedNodesMu sync.RWMutex
@@ -547,60 +542,6 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 
 	reply.RetToken = AttemptGenerateToken(storageTrace)
 	return nil
-}
-
-func (d *FrontEnd) recordSuccess(trace *tracing.Trace, action interface{}) {
-	var storageStarted bool
-
-	d.storageMu.RLock()
-	storageStarted = d.storageStarted
-	if storageStarted {
-		AttemptRecordAction(trace, action)
-	}
-	d.storageMu.RUnlock()
-
-	if storageStarted {
-		return
-	}
-
-	// storageStarted == false case, flip to true
-	d.storageMu.Lock()
-	if d.storageStarted == false {
-		d.once.Do(func() {}) // if invoked, the very first storage RPC succeeded
-		d.storageStarted = true
-		AttemptRecordAction(d.frontendTrace, FrontEndStorageStarted{})
-	}
-	AttemptRecordAction(trace, action)
-	d.storageMu.Unlock()
-}
-
-func (d *FrontEnd) recordFailure(trace *tracing.Trace, action interface{}) {
-	var storageStarted bool
-
-	d.storageMu.RLock()
-	storageStarted = d.storageStarted
-	if storageStarted == false {
-		// if invoked, the very first storage RPC failed, but storageStarted
-		// is initially set to false, so we must explicitly record StorageFailed
-		d.once.Do(func() {
-			AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{})
-		})
-		AttemptRecordAction(trace, action)
-	}
-	d.storageMu.RUnlock()
-
-	if !storageStarted {
-		return
-	}
-
-	// storageStarted == true case, flip to false
-	d.storageMu.Lock()
-	if d.storageStarted {
-		d.storageStarted = false
-		AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{})
-	}
-	AttemptRecordAction(trace, action)
-	d.storageMu.Unlock()
 }
 
 func (d *FrontEnd) enqueueOperation(key string, ch StartOpChan) {
