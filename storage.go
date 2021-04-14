@@ -61,15 +61,17 @@ type StorageJoined struct {
 }
 
 type Storage struct {
-	stracer  *tracing.Tracer
-	strace   *tracing.Trace
-	recorder *StoreRecorder
-	store    *Store
+	storageID string
+	stracer   *tracing.Tracer
+	strace    *tracing.Trace
+	recorder  *StoreRecorder
+	store     *Store
 }
 
 type Store struct {
-	mu sync.RWMutex
-	kv map[string]string
+	mu    sync.RWMutex
+	kv    map[string]string
+	ready bool
 }
 
 type StoreRecorder struct {
@@ -106,9 +108,30 @@ type StoragePutResp struct {
 	Token tracing.TracingToken
 }
 
+type StorageGetStateArgs struct {
+	Token tracing.TracingToken
+}
+
+type StorageGetStateResp struct {
+	State map[string]string
+	Token tracing.TracingToken
+}
+
+type StorageUpdateStateArgs struct {
+	State      map[string]string
+	SkipUpdate bool
+	Token      tracing.TracingToken
+}
+
+type StorageUpdateStateResp struct {
+	Token tracing.TracingToken
+}
+
 func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr string, diskPath string, stracer *tracing.Tracer) error {
 	// create local strace
 	s.stracer = stracer
+	s.storageID = storageId
+
 	if stracer != nil {
 		s.strace = stracer.CreateTrace()
 	}
@@ -144,14 +167,15 @@ func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr strin
 	log.Printf("serving Storage RPCs on port %s", storageAddr)
 	go server.Accept(listener)
 
-	// notify Frontend
-	args := StorageConnectArgs{
+	// join request to Frontend
+	AttemptRecordAction(s.strace, StorageJoining{StorageID: storageId})
+	args := StorageJoinArgs{
+		StorageID:   storageId,
 		StorageAddr: storageAddr,
 		Token:       AttemptGenerateToken(s.strace),
 	}
-
-	reply := StorageConnectResp{}
-	err = frontend.Call("FrontEnd.StorageConnect", args, &reply)
+	reply := StorageJoinResp{}
+	err = frontend.Call("FrontEnd.StorageJoin", args, &reply)
 	if err != nil {
 		return fmt.Errorf("failed to notify Frontend: %w", err)
 	}
@@ -166,8 +190,9 @@ func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr strin
 
 func (s *Storage) initStore() error {
 	s.store = &Store{
-		mu: sync.RWMutex{},
-		kv: make(map[string]string),
+		mu:    sync.RWMutex{},
+		kv:    make(map[string]string),
+		ready: false,
 	}
 
 	if s.recorder.size > 0 {
@@ -207,10 +232,33 @@ func (s *Storage) initStore() error {
 	return nil
 }
 
+func (s *Storage) mergeStore(that map[string]string) error {
+	for k, thatV := range that {
+		thisV, ok := s.store.get(k)
+		if !ok || thisV != thatV {
+			s.store.put(k, thatV)
+			err := s.recorder.record(StoreRecord{
+				Key:   k,
+				Value: thatV,
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Storage) Get(args StorageGetArgs, reply *StorageGetResp) error {
 	trace := s.AttemptReceiveToken(&args.Token)
 
 	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+
+	if !s.store.ready {
+		return fmt.Errorf("storage %s not joined", s.storageID)
+	}
+
 	AttemptRecordAction(trace, StorageGet{Key: args.Key})
 	value, ok := s.store.get(args.Key)
 
@@ -222,7 +270,6 @@ func (s *Storage) Get(args StorageGetArgs, reply *StorageGetResp) error {
 		Key:   args.Key,
 		Value: resultVal,
 	})
-	s.store.mu.RUnlock()
 
 	reply.Value = value
 	reply.Ok = ok
@@ -234,6 +281,12 @@ func (s *Storage) Put(args StoragePutArgs, reply *StoragePutResp) error {
 	trace := s.AttemptReceiveToken(&args.Token)
 
 	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	if !s.store.ready {
+		return fmt.Errorf("storage %s not joined", s.storageID)
+	}
+
 	AttemptRecordAction(trace, StoragePut{
 		Key:   args.Key,
 		Value: args.Value,
@@ -250,9 +303,45 @@ func (s *Storage) Put(args StoragePutArgs, reply *StoragePutResp) error {
 		Key:   args.Key,
 		Value: value,
 	})
-	s.store.mu.Unlock()
 
 	reply.Value = value
+	reply.Token = AttemptGenerateToken(trace)
+	return nil
+}
+
+func (s *Storage) GetState(args StorageGetStateArgs, reply *StorageGetStateResp) error {
+	trace := s.AttemptReceiveToken(&args.Token)
+
+	s.store.mu.RLock()
+	defer s.store.mu.RUnlock()
+
+	if !s.store.ready {
+		return fmt.Errorf("storage %s not joined", s.storageID)
+	}
+
+	reply.State = s.store.kv
+	reply.Token = AttemptGenerateToken(trace)
+	return nil
+}
+
+func (s *Storage) UpdateState(args StorageUpdateStateArgs, reply *StorageUpdateStateResp) error {
+	trace := s.AttemptReceiveToken(&args.Token)
+
+	s.store.mu.Lock()
+	defer s.store.mu.Unlock()
+
+	if !args.SkipUpdate {
+		// merge with latest store
+		if err := s.mergeStore(args.State); err != nil {
+			return fmt.Errorf("failed to merge state from Frontend: %w", err)
+		}
+	}
+	s.store.ready = true
+	AttemptRecordAction(s.strace, StorageJoined{
+		StorageID: s.storageID,
+		State:     s.store.kv,
+	})
+
 	reply.Token = AttemptGenerateToken(trace)
 	return nil
 }

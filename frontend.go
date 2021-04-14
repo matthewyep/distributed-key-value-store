@@ -537,7 +537,7 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 	}
 
 	// update succeeded, add node to joined nodes
-	d.AttemptReceiveToken(&updateResp.RetToken)
+	d.AttemptReceiveToken(&updateResp.Token)
 	storageTrace.RecordAction(FrontEndDebug{"Sent recent state to joining node"})
 
 	d.joinedNodesMu.Lock()
