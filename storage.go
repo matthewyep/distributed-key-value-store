@@ -132,10 +132,8 @@ func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr strin
 	s.stracer = stracer
 	s.storageID = storageId
 
-	var jtrace *tracing.Trace
 	if stracer != nil {
 		s.strace = stracer.CreateTrace()
-		jtrace = stracer.CreateTrace()
 	}
 
 	// initialize/recover state
@@ -174,7 +172,7 @@ func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr strin
 	args := StorageJoinArgs{
 		StorageID:   storageId,
 		StorageAddr: storageAddr,
-		Token:       AttemptGenerateToken(jtrace),
+		Token:       AttemptGenerateToken(s.strace),
 	}
 	reply := StorageJoinResp{}
 	err = frontend.Call("FrontEnd.StorageJoin", args, &reply)
@@ -234,7 +232,6 @@ func (s *Storage) initStore() error {
 	return nil
 }
 
-// TODO: Address total failure race condition
 func (s *Storage) mergeStore(that map[string]string) error {
 	for k, thatV := range that {
 		thisV, ok := s.store.get(k)
