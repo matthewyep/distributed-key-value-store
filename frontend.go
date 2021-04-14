@@ -103,9 +103,6 @@ type FrontEnd struct {
 	joiningOps    map[string][]StartOpChan
 	joiningOpsMu  sync.Mutex
 	putWg         sync.WaitGroup
-
-	txnQueue []StartOpChan
-	txnMu    sync.Mutex
 }
 
 type StartOpChan chan struct{}
@@ -137,7 +134,6 @@ func (d *FrontEnd) Start(clientAPIListenAddr string, storageAPIListenAddr string
 	d.ops = make(map[string][]StartOpChan)
 	d.joinedNodes = make(map[string]*rpc.Client)
 	d.joiningOps = make(map[string][]StartOpChan)
-	d.txnQueue = make([]StartOpChan, 0, 25)
 
 	server := rpc.NewServer()
 	err := server.Register(d)
@@ -170,8 +166,8 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 	defer d.dequeueOperation(args.Key)
 	<-startCh
 
-	// using write mutex to enforce request ordering
-	d.joinedNodesMu.Lock()
+	// send storage get requests
+	d.joinedNodesMu.RLock()
 	numNodes := len(d.joinedNodes)
 	callResults := make(chan *StorageReqCall, numNodes)
 	succeeded := false
@@ -184,7 +180,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 			Value: nil,
 			Err:   true,
 		})
-		d.joinedNodesMu.Unlock()
+		d.joinedNodesMu.RUnlock()
 
 		reply.Key = args.Key
 		reply.Ok = false
@@ -192,9 +188,6 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		reply.RetToken = AttemptGenerateToken(trace)
 		return nil
 	}
-
-	queue := make(StartOpChan, 1)
-	d.enqueueTransaction(queue)
 
 	var respVal string
 	var respOk bool
@@ -217,7 +210,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 			callResults <- &StorageReqCall{storageID, call}
 		}(storageID)
 	}
-	d.joinedNodesMu.Unlock()
+	d.joinedNodesMu.RUnlock()
 
 	var failedNodes []string
 
@@ -257,10 +250,6 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		d.joinedNodesMu.RUnlock()
 	}
 
-	// wait for turn in transaction queue
-	<-queue
-	defer d.dequeueTransaction()
-
 	if len(failedNodes) != 0 {
 		// remove failed nodes from the joined set
 		d.joinedNodesMu.Lock()
@@ -279,7 +268,8 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		value = &respVal
 	}
 
-	if succeeded {
+	d.joinedNodesMu.RLock()
+	if succeeded && len(d.joinedNodes) != 0 {
 		AttemptRecordAction(trace, FrontEndGetResult{
 			Key:   args.Key,
 			Value: value,
@@ -294,6 +284,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		})
 		reply.Error = true
 	}
+	d.joinedNodesMu.RUnlock()
 
 	reply.Key = args.Key
 	reply.Value = respVal
@@ -327,8 +318,8 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 	}
 	defer d.putWg.Done()
 
-	// using write mutex to enforce request ordering
-	d.joinedNodesMu.Lock()
+	// send storage put requests
+	d.joinedNodesMu.RLock()
 	numNodes := len(d.joinedNodes)
 	callResults := make(chan *StorageReqCall, numNodes)
 	succeeded := false
@@ -337,14 +328,11 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 		// no storage nodes joined, so abort immediately
 		trace.RecordAction(TotalFailure{})
 		AttemptRecordAction(trace, FrontEndPutResult{true})
-		d.joinedNodesMu.Unlock()
+		d.joinedNodesMu.RUnlock()
 		reply.Error = true
 		reply.RetToken = AttemptGenerateToken(trace)
 		return nil
 	}
-
-	queue := make(StartOpChan, 1)
-	d.enqueueTransaction(queue)
 
 	for storageID, client := range d.joinedNodes {
 		storageArgs := StoragePutArgs{
@@ -363,7 +351,7 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 			callResults <- &StorageReqCall{storageID, call}
 		}(storageID)
 	}
-	d.joinedNodesMu.Unlock()
+	d.joinedNodesMu.RUnlock()
 
 	var failedNodes []string
 
@@ -404,10 +392,6 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 		d.joinedNodesMu.RUnlock()
 	}
 
-	// wait for turn in transaction queue
-	<-queue
-	defer d.dequeueTransaction()
-
 	if len(failedNodes) != 0 {
 		// remove failed nodes from the joined set
 		d.joinedNodesMu.Lock()
@@ -421,13 +405,15 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 		d.joinedNodesMu.Unlock()
 	}
 
-	if succeeded {
+	d.joinedNodesMu.RLock()
+	if succeeded && len(d.joinedNodes) != 0 {
 		AttemptRecordAction(trace, FrontEndPutResult{Err: false})
 		reply.Error = false
 	} else {
 		AttemptRecordAction(trace, FrontEndPutResult{Err: true})
 		reply.Error = true
 	}
+	d.joinedNodesMu.RUnlock()
 
 	reply.RetToken = AttemptGenerateToken(trace)
 	return nil
@@ -592,28 +578,6 @@ func (d *FrontEnd) unsafeDequeueJoinOp(key string) {
 	} else {
 		d.joiningOps[key] = chQueue[1:]
 		d.joiningOps[key][0] <- struct{}{}
-	}
-}
-
-func (d *FrontEnd) enqueueTransaction(ch StartOpChan) {
-	d.txnMu.Lock()
-	defer d.txnMu.Unlock()
-
-	d.txnQueue = append(d.txnQueue, ch)
-
-	if len(d.txnQueue) == 1 {
-		ch <- struct{}{}
-	}
-}
-
-func (d *FrontEnd) dequeueTransaction() {
-	d.txnMu.Lock()
-	defer d.txnMu.Unlock()
-
-	d.txnQueue = d.txnQueue[1:]
-
-	if len(d.txnQueue) > 0 {
-		d.txnQueue[0] <- struct{}{}
 	}
 }
 
