@@ -65,12 +65,13 @@ type FrontEnd struct {
 type StartOpChan chan struct{}
 
 /***** RPC structs *****/
-type StorageConnectArgs struct {
+type StorageJoinArgs struct {
+	StorageID   string
 	StorageAddr string
 	Token       tracing.TracingToken
 }
 
-type StorageConnectResp struct {
+type StorageJoinResp struct {
 	RetToken tracing.TracingToken
 }
 
@@ -298,7 +299,7 @@ func (d *FrontEnd) ResultAck(args kvslib.ResultAckArgs, reply *kvslib.ResultAckR
 	return nil
 }
 
-func (d *FrontEnd) StorageConnect(args StorageConnectArgs, reply *StorageConnectResp) error {
+func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) error {
 	storageTrace := d.AttemptReceiveToken(&args.Token)
 
 	const numRetries int = 2
