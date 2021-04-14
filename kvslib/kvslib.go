@@ -96,15 +96,6 @@ type FrontendPutResp struct {
 	Error    bool
 }
 
-type ResultAckArgs struct {
-	Key   string
-	Token tracing.TracingToken
-}
-
-type ResultAckResp struct {
-	RetToken tracing.TracingToken
-}
-
 const (
 	Get = "get"
 	Put = "put"
@@ -254,18 +245,6 @@ func (d *KVS) getAsync(trace *tracing.Trace, key string, opId uint32, startCh St
 		Value: value,
 		Err:   response.Error,
 	})
-
-	ackArgs := ResultAckArgs{
-		Key:   key,
-		Token: AttemptGenerateToken(trace),
-	}
-	ackResp := ResultAckResp{}
-
-	if err := d.frontend.Call("FrontEnd.ResultAck", ackArgs, &ackResp); err != nil {
-		log.Fatalln(err)
-	}
-
-	d.AttemptReceiveToken(&ackResp.RetToken)
 
 	d.notifyCh <- ResultStruct{
 		OpId:        opId,

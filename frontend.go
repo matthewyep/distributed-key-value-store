@@ -429,15 +429,6 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 	return nil
 }
 
-func (d *FrontEnd) ResultAck(args kvslib.ResultAckArgs, reply *kvslib.ResultAckResp) error {
-	trace := d.AttemptReceiveToken(&args.Token)
-
-	d.dequeueOperation(args.Key)
-
-	reply.RetToken = AttemptGenerateToken(trace)
-	return nil
-}
-
 func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) error {
 	storageTrace := d.AttemptReceiveToken(&args.Token)
 	storageID := args.StorageID
