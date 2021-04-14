@@ -82,6 +82,10 @@ type FailedNodes struct {
 	IDs []string
 }
 
+type FrontEndDebug struct {
+	Message string
+}
+
 type TotalFailure struct{}
 
 type FrontEnd struct {
@@ -440,6 +444,8 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		return nil
 	}
 
+	storageTrace.RecordAction(FrontEndDebug{"Successfully dialed storage, waiting for join mutex"})
+
 	d.joiningOpsMu.Lock()
 	if len(d.joiningOps) == 0 {
 		// block all put requests
@@ -450,6 +456,8 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 	start := make(StartOpChan, 1)
 	d.unsafeEnqueueJoinOp(storageID, start)
 	d.joiningOpsMu.Unlock()
+
+	storageTrace.RecordAction(FrontEndDebug{"Enqueued join op"})
 
 	defer func() {
 		d.unsafeDequeueJoinOp(storageID)
@@ -463,9 +471,12 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 
 	// wait for all outstanding put requests to complete
 	d.putWg.Wait()
+	storageTrace.RecordAction(FrontEndDebug{"Finished waiting for wg"})
 
 	// if there are other storage join ops with this ID queued up, wait for them to finish
 	<-start
+	storageTrace.RecordAction(FrontEndDebug{"Finished waiting in queue"})
+
 	skipUpdate := false
 
 	d.joinedNodesMu.Lock()
@@ -509,6 +520,8 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		recentState = getStateResp.State
 	}
 
+	storageTrace.RecordAction(FrontEndDebug{"Got most recent state"})
+
 	// send state to joining node
 	updateArgs := StorageUpdateStateArgs{
 		State:      recentState,
@@ -525,6 +538,7 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 
 	// update succeeded, add node to joined nodes
 	d.AttemptReceiveToken(&updateResp.RetToken)
+	storageTrace.RecordAction(FrontEndDebug{"Sent recent state to joining node"})
 
 	d.joinedNodesMu.Lock()
 	d.joinedNodes[storageID] = client
