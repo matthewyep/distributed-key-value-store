@@ -168,6 +168,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 	// wait for start signal
 	startCh := make(StartOpChan, 1)
 	d.enqueueOperation(args.Key, startCh)
+	defer d.dequeueOperation(args.Key)
 	<-startCh
 
 	// using write mutex to enforce request ordering
@@ -207,7 +208,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		storageResp := StorageGetResp{}
 
 		call := client.Go("Storage.Get", storageArgs, &storageResp, nil)
-		go func() {
+		go func(storageID string) {
 			<-call.Done
 			if call.Error == nil {
 				d.AttemptReceiveToken(&storageResp.Token)
@@ -215,7 +216,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 				respOk = storageResp.Ok
 			}
 			callResults <- &StorageReqCall{storageID, call}
-		}()
+		}(storageID)
 	}
 	d.joinedNodesMu.Unlock()
 
@@ -228,7 +229,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 			trace.RecordAction(FrontEndGetFailed{storageCall.ID, args.Key})
 		} else {
 			succeeded = true
-			trace.RecordAction(FrontEndPutSucceeded{storageCall.ID, args.Key, respVal})
+			trace.RecordAction(FrontEndGetSucceeded{storageCall.ID, args.Key, respVal})
 		}
 	}
 
@@ -246,7 +247,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 					Token: AttemptGenerateToken(trace),
 				}
 				storageResp := StorageGetResp{}
-				err := client.Call("Storage.Put", storageArgs, storageResp)
+				err := client.Call("Storage.Get", storageArgs, storageResp)
 				// TODO: remove this assertion later
 				if err == nil {
 					// the retry should never succeed
@@ -311,10 +312,8 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 
 	// wait for start signal
 	startCh := make(StartOpChan, 1)
-	defer func() {
-		d.dequeueOperation(args.Key)
-	}()
 	d.enqueueOperation(args.Key, startCh)
+	defer d.dequeueOperation(args.Key)
 	<-startCh
 
 	// spinlock blocks until no storage nodes are joining
@@ -322,6 +321,7 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 		d.joiningMu.RLock()
 		if d.joining == false {
 			d.putWg.Add(1)
+			d.joiningMu.RUnlock()
 			break
 		}
 		d.joiningMu.RUnlock()
@@ -356,13 +356,13 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 		storageResp := StoragePutResp{}
 
 		call := client.Go("Storage.Put", storageArgs, &storageResp, nil)
-		go func() {
+		go func(storageID string) {
 			<-call.Done
 			if call.Error == nil {
 				d.AttemptReceiveToken(&storageResp.Token)
 			}
 			callResults <- &StorageReqCall{storageID, call}
-		}()
+		}(storageID)
 	}
 	d.joinedNodesMu.Unlock()
 
@@ -505,7 +505,7 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		for _, joinedClient := range d.joinedNodes {
 			getStateArgs := StorageGetStateArgs{AttemptGenerateToken(storageTrace)}
 
-			err := joinedClient.Call("Storage.GetStore", getStateArgs, &getStateResp)
+			err := joinedClient.Call("Storage.GetState", getStateArgs, &getStateResp)
 			if err == nil {
 				d.AttemptReceiveToken(&getStateResp.Token)
 				getStateSucceeded = true
