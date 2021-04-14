@@ -472,7 +472,6 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{storageID})
 		d.UnsafeRecordFEStorageJoined()
 	}
-	AttemptRecordAction(d.frontendTrace, FrontEndStorageStarted{storageID})
 	if len(d.joinedNodes) == 0 {
 		skipUpdate = true
 	}
@@ -518,7 +517,6 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 	err = client.Call("Storage.UpdateState", updateArgs, &updateResp)
 	if err != nil {
 		reply.RetToken = AttemptGenerateToken(storageTrace)
-		AttemptRecordAction(d.frontendTrace, FrontEndStorageFailed{storageID})
 		return nil
 	}
 
@@ -528,6 +526,7 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 
 	d.joinedNodesMu.Lock()
 	d.joinedNodes[storageID] = client
+	AttemptRecordAction(d.frontendTrace, FrontEndStorageStarted{storageID})
 	d.UnsafeRecordFEStorageJoined()
 	d.joinedNodesMu.Unlock()
 
