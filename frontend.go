@@ -454,6 +454,7 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 	storageTrace.RecordAction(FrontEndDebug{"Enqueued join op"})
 
 	defer func() {
+		d.joiningOpsMu.Lock()
 		d.unsafeDequeueJoinOp(storageID)
 		if len(d.joiningOps) == 0 {
 			// unblock put requests
@@ -462,6 +463,7 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 			d.joiningCond.Broadcast()
 			d.joiningCond.L.Unlock()
 		}
+		d.joiningOpsMu.Unlock()
 	}()
 
 	// wait for all outstanding requests to complete
