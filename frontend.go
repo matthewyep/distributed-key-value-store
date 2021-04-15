@@ -1,7 +1,7 @@
 package distkvs
 
 import (
-	"example.org/cpsc416/a5/kvslib"
+	"example.org/cpsc416/a6/kvslib"
 	"fmt"
 	"github.com/DistributedClocks/tracing"
 	"log"

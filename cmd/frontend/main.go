@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	distkvs "example.org/cpsc416/a5"
+	distkvs "example.org/cpsc416/a6"
 	"github.com/DistributedClocks/tracing"
 )
 

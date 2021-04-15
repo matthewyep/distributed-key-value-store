@@ -2,7 +2,7 @@ package distkvs
 
 import (
 	"errors"
-	"example.org/cpsc416/a5/kvslib"
+	"example.org/cpsc416/a6/kvslib"
 	"github.com/DistributedClocks/tracing"
 )
 

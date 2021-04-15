@@ -5,7 +5,7 @@ import (
 	"github.com/DistributedClocks/tracing"
 	"log"
 
-	distkvs "example.org/cpsc416/a5"
+	distkvs "example.org/cpsc416/a6"
 )
 
 func main() {
