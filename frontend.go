@@ -99,7 +99,7 @@ type FrontEnd struct {
 	joinedNodes   map[string]*rpc.Client
 	joinedNodesMu sync.RWMutex
 	joining       bool
-	joiningMu     sync.RWMutex
+	joiningCond   *sync.Cond
 	joiningOps    map[string][]StartOpChan
 	joiningOpsMu  sync.Mutex
 	putWg         sync.WaitGroup
@@ -134,6 +134,7 @@ func (d *FrontEnd) Start(clientAPIListenAddr string, storageAPIListenAddr string
 	d.ops = make(map[string][]StartOpChan)
 	d.joinedNodes = make(map[string]*rpc.Client)
 	d.joiningOps = make(map[string][]StartOpChan)
+	d.joiningCond = sync.NewCond(&sync.Mutex{})
 
 	server := rpc.NewServer()
 	err := server.Register(d)
@@ -306,16 +307,13 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 	defer d.dequeueOperation(args.Key)
 	<-startCh
 
-	// spinlock blocks until no storage nodes are joining
-	for {
-		d.joiningMu.RLock()
-		if d.joining == false {
-			d.putWg.Add(1)
-			d.joiningMu.RUnlock()
-			break
-		}
-		d.joiningMu.RUnlock()
+	// cond blocks until no storage nodes are joining
+	d.joiningCond.L.Lock()
+	for d.joining == true {
+		d.joiningCond.Wait()
 	}
+	d.putWg.Add(1)
+	d.joiningCond.L.Unlock()
 	defer d.putWg.Done()
 
 	// send storage put requests
@@ -435,10 +433,11 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 	d.joiningOpsMu.Lock()
 	if len(d.joiningOps) == 0 {
 		// block all put requests
-		d.joiningMu.Lock()
+		d.joiningCond.L.Lock()
 		d.joining = true
-		d.joiningMu.Unlock()
+		d.joiningCond.L.Unlock()
 	}
+	storageTrace.RecordAction(FrontEndDebug{"successfully changed d.joining"})
 	start := make(StartOpChan, 1)
 	d.unsafeEnqueueJoinOp(storageID, start)
 	d.joiningOpsMu.Unlock()
@@ -449,13 +448,15 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		d.unsafeDequeueJoinOp(storageID)
 		if len(d.joiningOps) == 0 {
 			// unblock put requests
-			d.joiningMu.Lock()
+			d.joiningCond.L.Lock()
 			d.joining = false
-			d.joiningMu.Unlock()
+			d.joiningCond.Broadcast()
+			d.joiningCond.L.Unlock()
 		}
 	}()
 
 	// wait for all outstanding put requests to complete
+	storageTrace.RecordAction(FrontEndDebug{"About to wait for PUT wg"})
 	d.putWg.Wait()
 	storageTrace.RecordAction(FrontEndDebug{"Finished waiting for wg"})
 
