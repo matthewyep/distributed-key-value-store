@@ -102,7 +102,7 @@ type FrontEnd struct {
 	joiningCond   *sync.Cond
 	joiningOps    map[string][]StartOpChan
 	joiningOpsMu  sync.Mutex
-	putWg         sync.WaitGroup
+	reqWg         sync.WaitGroup
 }
 
 type StartOpChan chan struct{}
@@ -166,6 +166,15 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 	d.enqueueOperation(args.Key, startCh)
 	defer d.dequeueOperation(args.Key)
 	<-startCh
+
+	// cond blocks until no storage nodes are joining
+	d.joiningCond.L.Lock()
+	for d.joining == true {
+		d.joiningCond.Wait()
+	}
+	d.reqWg.Add(1)
+	d.joiningCond.L.Unlock()
+	defer d.reqWg.Done()
 
 	// send storage get requests
 	d.joinedNodesMu.RLock()
@@ -312,9 +321,9 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 	for d.joining == true {
 		d.joiningCond.Wait()
 	}
-	d.putWg.Add(1)
+	d.reqWg.Add(1)
 	d.joiningCond.L.Unlock()
-	defer d.putWg.Done()
+	defer d.reqWg.Done()
 
 	// send storage put requests
 	d.joinedNodesMu.RLock()
@@ -455,9 +464,9 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		}
 	}()
 
-	// wait for all outstanding put requests to complete
+	// wait for all outstanding requests to complete
 	storageTrace.RecordAction(FrontEndDebug{"About to wait for PUT wg"})
-	d.putWg.Wait()
+	d.reqWg.Wait()
 	storageTrace.RecordAction(FrontEndDebug{"Finished waiting for wg"})
 
 	// if there are other storage join ops with this ID queued up, wait for them to finish
