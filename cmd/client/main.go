@@ -4,8 +4,8 @@ import (
 	"flag"
 	"log"
 
-	distkvs "example.org/cpsc416/a5"
-	"example.org/cpsc416/a5/kvslib"
+	distkvs "example.org/cpsc416/a6"
+	"example.org/cpsc416/a6/kvslib"
 )
 
 func main() {
@@ -26,7 +26,7 @@ func main() {
 	if err, _ := client.Get("clientID1", "key1"); err != 0 {
 		log.Println(err)
 	}
-	if err, _ := client.Put("clientID1", "key2", "value2"); err != 0 {
+	if err, _ := client.Put("clientID1", "key2", "value6"); err != 0 {
 		log.Println(err)
 	}
 

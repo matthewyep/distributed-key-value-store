@@ -1,4 +1,4 @@
-module example.org/cpsc416/a5
+module example.org/cpsc416/a6
 
 go 1.14
 

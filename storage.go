@@ -138,7 +138,7 @@ func (s *Storage) Start(storageId string, frontEndAddr string, storageAddr strin
 
 	// initialize/recover state
 	recorder := &StoreRecorder{}
-	err := recorder.init(diskPath)
+	err := recorder.init(diskPath, storageId)
 	if err != nil {
 		return fmt.Errorf("failed to initialize store: %w", err)
 	}
@@ -346,11 +346,11 @@ func (s *Storage) UpdateState(args StorageUpdateStateArgs, reply *StorageUpdateS
 	return nil
 }
 
-func (r *StoreRecorder) init(diskPath string) error {
+func (r *StoreRecorder) init(diskPath string, storageId string) error {
 	if err := os.MkdirAll(diskPath, os.ModePerm); err != nil {
 		return err
 	}
-	filePath := diskPath + "store_record.log"
+	filePath := fmt.Sprintf("%s%s.log", diskPath, storageId)
 	file, openErr := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
 	stat, statErr := os.Stat(filePath)
 	if openErr != nil || statErr != nil {
