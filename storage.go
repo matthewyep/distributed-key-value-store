@@ -227,7 +227,10 @@ func (s *Storage) initStore() error {
 			}
 		}
 	}
-	AttemptRecordAction(s.strace, StorageLoadSuccess{State: s.store.kv})
+	AttemptRecordAction(s.strace, StorageLoadSuccess{
+		StorageID: s.storageID,
+		State:     s.store.kv,
+	})
 
 	return nil
 }
@@ -259,7 +262,10 @@ func (s *Storage) Get(args StorageGetArgs, reply *StorageGetResp) error {
 		return fmt.Errorf("storage %s not joined", s.storageID)
 	}
 
-	AttemptRecordAction(trace, StorageGet{Key: args.Key})
+	AttemptRecordAction(trace, StorageGet{
+		StorageID: s.storageID,
+		Key:       args.Key,
+	})
 	value, ok := s.store.get(args.Key)
 
 	var resultVal *string = nil
@@ -267,8 +273,9 @@ func (s *Storage) Get(args StorageGetArgs, reply *StorageGetResp) error {
 		resultVal = &value
 	}
 	AttemptRecordAction(trace, StorageGetResult{
-		Key:   args.Key,
-		Value: resultVal,
+		StorageID: s.storageID,
+		Key:       args.Key,
+		Value:     resultVal,
 	})
 
 	reply.Value = value
@@ -288,8 +295,9 @@ func (s *Storage) Put(args StoragePutArgs, reply *StoragePutResp) error {
 	}
 
 	AttemptRecordAction(trace, StoragePut{
-		Key:   args.Key,
-		Value: args.Value,
+		StorageID: s.storageID,
+		Key:       args.Key,
+		Value:     args.Value,
 	})
 	value := s.store.put(args.Key, args.Value)
 	err := s.recorder.record(StoreRecord{
@@ -300,8 +308,9 @@ func (s *Storage) Put(args StoragePutArgs, reply *StoragePutResp) error {
 		return fmt.Errorf("failed to save to disk: %w", err)
 	}
 	AttemptRecordAction(trace, StorageSaveData{
-		Key:   args.Key,
-		Value: value,
+		StorageID: s.storageID,
+		Key:       args.Key,
+		Value:     value,
 	})
 
 	reply.Value = value
