@@ -148,6 +148,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 	// send storage get requests
 	d.joinedNodesMu.RLock()
 	numNodes := len(d.joinedNodes)
+	succeeded := false
 
 	if numNodes == 0 {
 		// no storage nodes joined, so abort immediately
@@ -165,6 +166,9 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		return nil
 	}
 
+	var respVal string
+	var respOk bool
+
 	var failedNodes []string
 
 	for storageID, client := range d.joinedNodes {
@@ -181,6 +185,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		} else {
 			// succeeded, immediately log FrontEndGetResult and return
 			d.AttemptReceiveToken(&storageResp.Token)
+
 			var value *string = nil
 			if storageResp.Ok {
 				value = &storageResp.Value
@@ -191,18 +196,19 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 				Err:   false,
 			})
 
-			reply.Key = args.Key
-			reply.Value = storageResp.Value
-			reply.Ok = storageResp.Ok
-			reply.Error = false
-			reply.RetToken = AttemptGenerateToken(trace)
-			d.joinedNodesMu.RUnlock()
-			return nil
+			respVal = storageResp.Value
+			respOk = storageResp.Ok
+			succeeded = true
+			break
 		}
 	}
 	d.joinedNodesMu.RUnlock()
 
-	// at this point, all requests have failed
+	retryTrace := trace
+	if succeeded {
+		// if we've already logged FrontEndGetResult, set retryTrace to nil just in case
+		retryTrace = nil
+	}
 
 	// if some requests failed, then retry on those nodes
 	// since RPC is using the same TCP connection, the retry should always fail
@@ -214,7 +220,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 			if client, ok := d.joinedNodes[storageID]; ok {
 				storageArgs := StorageGetArgs{
 					Key:   args.Key,
-					Token: AttemptGenerateToken(trace),
+					Token: AttemptGenerateToken(retryTrace),
 				}
 				storageResp := StorageGetResp{}
 				_ = client.Call("Storage.Get", storageArgs, storageResp)
@@ -225,7 +231,6 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 
 	if len(failedNodes) != 0 {
 		// remove failed nodes from the joined set
-		// the joined set should be empty after this completes
 		d.joinedNodesMu.Lock()
 		for _, storageID := range failedNodes {
 			if _, ok := d.joinedNodes[storageID]; ok {
@@ -237,16 +242,22 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		d.joinedNodesMu.Unlock()
 	}
 
-	// total failure at this point, so log err = true
-	AttemptRecordAction(trace, FrontEndGetResult{
-		Key:   args.Key,
-		Value: nil,
-		Err:   true,
-	})
+	if succeeded {
+		// already logged FrontEndGetResult
+		reply.Error = false
+	} else {
+		// total failure at this point, so log err = true
+		AttemptRecordAction(trace, FrontEndGetResult{
+			Key:   args.Key,
+			Value: nil,
+			Err:   true,
+		})
+		reply.Error = true
+	}
 
-	reply.Error = true
 	reply.Key = args.Key
-	reply.Ok = false
+	reply.Value = respVal
+	reply.Ok = respOk
 	reply.RetToken = AttemptGenerateToken(trace)
 	return nil
 }
