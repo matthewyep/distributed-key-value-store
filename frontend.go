@@ -148,7 +148,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 	// send storage get requests
 	d.joinedNodesMu.RLock()
 	numNodes := len(d.joinedNodes)
-	callResults := make(chan *StorageReqCall, numNodes)
+	//callResults := make(chan *StorageReqCall, numNodes)
 	succeeded := false
 
 	if numNodes == 0 {
@@ -170,6 +170,8 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 	var respVal string
 	var respOk bool
 
+	var failedNodes []string
+
 	for storageID, client := range d.joinedNodes {
 		storageArgs := StorageGetArgs{
 			Key:   args.Key,
@@ -177,29 +179,31 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		}
 		storageResp := StorageGetResp{}
 
-		call := client.Go("Storage.Get", storageArgs, &storageResp, nil)
-		go func(storageID string) {
-			<-call.Done
-			if call.Error == nil {
-				d.AttemptReceiveToken(&storageResp.Token)
-				respVal = storageResp.Value
-				respOk = storageResp.Ok
-			}
-			callResults <- &StorageReqCall{storageID, call}
-		}(storageID)
+		err := client.Call("Storage.Get", storageArgs, &storageResp)
+		if err != nil {
+			// failed
+			failedNodes = append(failedNodes, storageID)
+		} else {
+			// succeeded
+			d.AttemptReceiveToken(&storageResp.Token)
+			respVal = storageResp.Value
+			respOk = storageResp.Ok
+			succeeded = true
+			break
+		}
 	}
 	d.joinedNodesMu.RUnlock()
 
-	var failedNodes []string
-
-	for i := 0; i < numNodes; i++ {
-		storageCall := <-callResults
-		if storageCall.Call.Error != nil {
-			failedNodes = append(failedNodes, storageCall.ID)
-		} else {
-			succeeded = true
-		}
-	}
+	//for i := 0; i < numNodes; i++ {
+	//	storageCall := <-callResults
+	//	if storageCall.Call.Error != nil {
+	//		failedNodes = append(failedNodes, storageCall.ID)
+	//		trace.RecordAction(FrontEndGetFailed{storageCall.ID, args.Key})
+	//	} else {
+	//		succeeded = true
+	//		trace.RecordAction(FrontEndGetSucceeded{storageCall.ID, args.Key, respVal})
+	//	}
+	//}
 
 	// if some requests failed, then retry on those nodes
 	// since RPC is using the same TCP connection, the retry should always fail
