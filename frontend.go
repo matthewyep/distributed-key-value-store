@@ -451,7 +451,9 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		d.joinedNodesMu.RUnlock()
 
 		if getStateSucceeded == false {
-			storageTrace.RecordAction(FrontEndDebug{"ERROR: total failure should never occur when nodes are joining"})
+			AttemptRecordAction(storageTrace, FrontEndDebug{
+				Message: "ERROR: total failure should never occur when nodes are joining",
+			})
 			// arbitrarily tell storage node to use stale state (for "safety", instead of crashing completely)
 			skipUpdate = true
 		}
