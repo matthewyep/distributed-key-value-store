@@ -4,7 +4,6 @@ import (
 	"example.org/cpsc416/a6/kvslib"
 	"fmt"
 	"github.com/DistributedClocks/tracing"
-	"log"
 	"net"
 	"net/rpc"
 	"sync"
@@ -249,12 +248,7 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 					Token: AttemptGenerateToken(trace),
 				}
 				storageResp := StorageGetResp{}
-				err := client.Call("Storage.Get", storageArgs, storageResp)
-				// TODO: remove this assertion later
-				if err == nil {
-					// the retry should never succeed
-					log.Fatalf("retry to %v succeeded...\n", storageID)
-				}
+				_ = client.Call("Storage.Get", storageArgs, storageResp)
 			}
 		}
 		d.joinedNodesMu.RUnlock()
@@ -388,12 +382,7 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 					Token: AttemptGenerateToken(trace),
 				}
 				storageResp := StoragePutResp{}
-				err := client.Call("Storage.Put", storageArgs, storageResp)
-				// TODO: remove this assertion later
-				if err == nil {
-					// the retry should never succeed
-					log.Fatalf("retry to %v succeeded...\n", storageID)
-				}
+				_ = client.Call("Storage.Put", storageArgs, storageResp)
 			}
 		}
 		d.joinedNodesMu.RUnlock()
