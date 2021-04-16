@@ -52,40 +52,10 @@ type FrontEndStorageJoined struct {
 	StorageIds []string
 }
 
-// TODO: remove these later
-// Tracing structs for debugging
-type FrontEndGetFailed struct {
-	StorageID string
-	Key       string
-}
-
-type FrontEndGetSucceeded struct {
-	StorageID string
-	Key       string
-	Value     string
-}
-
-type FrontEndPutFailed struct {
-	StorageID string
-	Key       string
-	Value     string
-}
-
-type FrontEndPutSucceeded struct {
-	StorageID string
-	Key       string
-	Value     string
-}
-
-type FailedNodes struct {
-	IDs []string
-}
-
+// Debugging struct
 type FrontEndDebug struct {
 	Message string
 }
-
-type TotalFailure struct{}
 
 type FrontEnd struct {
 	// state may go here
@@ -183,7 +153,6 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 
 	if numNodes == 0 {
 		// no storage nodes joined, so abort immediately
-		trace.RecordAction(TotalFailure{})
 		AttemptRecordAction(trace, FrontEndGetResult{
 			Key:   args.Key,
 			Value: nil,
@@ -227,17 +196,14 @@ func (d *FrontEnd) Get(args kvslib.FrontendGetArgs, reply *kvslib.FrontendGetRes
 		storageCall := <-callResults
 		if storageCall.Call.Error != nil {
 			failedNodes = append(failedNodes, storageCall.ID)
-			trace.RecordAction(FrontEndGetFailed{storageCall.ID, args.Key})
 		} else {
 			succeeded = true
-			trace.RecordAction(FrontEndGetSucceeded{storageCall.ID, args.Key, respVal})
 		}
 	}
 
 	// if some requests failed, then retry on those nodes
 	// since RPC is using the same TCP connection, the retry should always fail
 	if len(failedNodes) != 0 {
-		trace.RecordAction(FailedNodes{failedNodes})
 		time.Sleep(time.Duration(d.storageTimeout) * time.Second)
 
 		d.joinedNodesMu.RLock()
@@ -327,7 +293,6 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 
 	if numNodes == 0 {
 		// no storage nodes joined, so abort immediately
-		trace.RecordAction(TotalFailure{})
 		AttemptRecordAction(trace, FrontEndPutResult{true})
 		d.joinedNodesMu.RUnlock()
 		reply.Error = true
@@ -360,17 +325,14 @@ func (d *FrontEnd) Put(args kvslib.FrontendPutArgs, reply *kvslib.FrontendPutRes
 		storageCall := <-callResults
 		if storageCall.Call.Error != nil {
 			failedNodes = append(failedNodes, storageCall.ID)
-			trace.RecordAction(FrontEndPutFailed{storageCall.ID, args.Key, args.Value})
 		} else {
 			succeeded = true
-			trace.RecordAction(FrontEndPutSucceeded{storageCall.ID, args.Key, args.Value})
 		}
 	}
 
 	// if some requests failed, then retry on those nodes
 	// since RPC is using the same TCP connection, the retry should always fail
 	if len(failedNodes) != 0 {
-		trace.RecordAction(FailedNodes{failedNodes})
 		time.Sleep(time.Duration(d.storageTimeout) * time.Second)
 
 		d.joinedNodesMu.RLock()
@@ -426,8 +388,6 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		return nil
 	}
 
-	storageTrace.RecordAction(FrontEndDebug{"Successfully dialed storage, waiting for join mutex"})
-
 	d.joiningOpsMu.Lock()
 	if len(d.joiningOps) == 0 {
 		// block all put requests
@@ -435,12 +395,10 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		d.joining = true
 		d.joiningCond.L.Unlock()
 	}
-	storageTrace.RecordAction(FrontEndDebug{"successfully changed d.joining"})
+
 	start := make(StartOpChan, 1)
 	d.unsafeEnqueueJoinOp(storageID, start)
 	d.joiningOpsMu.Unlock()
-
-	storageTrace.RecordAction(FrontEndDebug{"Enqueued join op"})
 
 	defer func() {
 		d.joiningOpsMu.Lock()
@@ -456,14 +414,10 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 	}()
 
 	// wait for all outstanding requests to complete
-	storageTrace.RecordAction(FrontEndDebug{"About to wait for PUT wg"})
 	d.reqWg.Wait()
-	storageTrace.RecordAction(FrontEndDebug{"Finished waiting for wg"})
 
 	// if there are other storage join ops with this ID queued up, wait for them to finish
 	<-start
-	storageTrace.RecordAction(FrontEndDebug{"Finished waiting in queue"})
-
 	skipUpdate := false
 
 	d.joinedNodesMu.Lock()
@@ -506,8 +460,6 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 		recentState = getStateResp.State
 	}
 
-	storageTrace.RecordAction(FrontEndDebug{"Got most recent state"})
-
 	// send state to joining node
 	updateArgs := StorageUpdateStateArgs{
 		State:      recentState,
@@ -523,7 +475,6 @@ func (d *FrontEnd) StorageJoin(args StorageJoinArgs, reply *StorageJoinResp) err
 
 	// update succeeded, add node to joined nodes
 	d.AttemptReceiveToken(&updateResp.Token)
-	storageTrace.RecordAction(FrontEndDebug{"Sent recent state to joining node"})
 
 	d.joinedNodesMu.Lock()
 	d.joinedNodes[storageID] = client
